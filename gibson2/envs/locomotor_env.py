@@ -1,4 +1,5 @@
 import gibson2
+import ipdb
 from gibson2.core.physics.interactive_objects import VisualMarker, InteractiveObj, BoxShape
 from gibson2.core.physics.robot_locomotors import Turtlebot
 from gibson2.utils.utils import parse_config, rotate_vector_3d, l2_distance, quatToXYZW, cartesian_to_polar
@@ -13,12 +14,18 @@ from torchvision import datasets, transforms
 from transforms3d.quaternions import quat2mat, qmult
 import gym
 import numpy as np
+import scipy.signal
 import os
 import pybullet as p
 from IPython import embed
 import cv2
 import time
 import collections
+import networkx as nx
+import tqdm
+
+import matplotlib.pyplot as plt
+plt.ion()
 
 
 class NavigateEnv(BaseEnv):
@@ -53,6 +60,9 @@ class NavigateEnv(BaseEnv):
                                           physics_timestep=physics_timestep,
                                           device_idx=device_idx)
         self.automatic_reset = automatic_reset
+        self.scan_map = None
+        self.prefetch_shortest_paths = True
+        self.shortest_paths = dict()
 
     def load_task_setup(self):
         """
@@ -182,6 +192,13 @@ class NavigateEnv(BaseEnv):
             self.comp.load_state_dict(
                 torch.load(os.path.join(gibson2.assets_path, 'networks', 'model.pth')))
             self.comp.eval()
+
+        if 'expert_action' in self.output:
+            # self.expert_action_space = gym.spaces.Box(low=0,
+            #                                           high=2,
+            #                                           shape=(),
+            #                                           dtype=np.int32)
+            observation_space['expert_action'] = self.load_action_space() # self.expert_action_space
 
         self.observation_space = gym.spaces.Dict(observation_space)
 
@@ -392,6 +409,20 @@ class NavigateEnv(BaseEnv):
                 state['rgb_filled'] = rgb_filled
         if 'scan' in self.output:
             state['scan'] = self.get_scan()
+
+        if 'expert_action' in self.output:
+            state['expert_action'] = self.get_expert_action()
+
+        if 'trav_map' in self.output:
+            trav_map = self.get_scan_map(kernel=1)
+
+            pos = self.robots[0].get_position()
+            pos_map = self.scene.world_to_map(pos[:2])
+            trav_map = np.tile(trav_map[..., None], [1, 1, 3])
+            trav_map[pos_map[0], pos_map[1], 0] = 255
+            trav_map[pos_map[0], pos_map[1], 1:] = 0
+            state['trav_map'] = trav_map
+
         return state
 
     def run_simulation(self):
@@ -467,6 +498,624 @@ class NavigateEnv(BaseEnv):
         """
         return l2_distance(self.target_pos, self.get_position_of_interest())
 
+    def transition_turn_and_move(self, turn_by, move_by):
+        # first turn (clockwise angle in rad) and move forward
+        pos = self.robots[0].get_position()
+        orn = self.robots[0].robot_body.get_orientation()
+        orn = qmult((euler2quat(turn_by, 0, 0)), orn)
+
+        x, y, z, w = orn
+        delta = quat2mat([w, x, y, z]).dot(np.array([move_by, 0, 0]))
+        pos = np.array(delta) + pos
+
+        return pos, orn
+
+    def get_scan_map(self, kernel=3):
+        trav_map = self.scene.floor_map[self.floor_num]
+        scan_map = self.scene.floor_scan[self.floor_num]
+
+        if scan_map.shape != trav_map.shape:
+            print ("Generate scan map")
+            self.scene.floor_scan[self.floor_num] = self.scene.process_scan_map(self.get_better_trav_map())
+            scan_map = self.scene.floor_scan[self.floor_num]
+            self.scene.floor_scan_graph[self.floor_num] = self.scene.get_graph(scan_map)
+
+        # scan_map = 255-np.clip(scipy.signal.convolve2d(255-scan_map, np.ones([kernel, kernel]), mode='same'), 0, 255)
+        # scan_map = np.array(scan_map, np.int32)
+        return scan_map
+
+    # def get_better_trav_map_simple(self):
+    #     from gibson2.data.datasets import get_model_path
+    #     from PIL import Image
+    #     filename = os.path.join(get_model_path(self.scene.model_id), 'floor_scan_{}.png'.format(self.floor_num))
+    #
+    #     # if os.path.exists(filename):
+    #     #     print("Load %s" % filename)
+    #     #     new_map = np.array(Image.open(filename))
+    #     #     return new_map
+    #
+    #     print("Generating %s" % filename)
+    #     trav = self.scene.floor_map[self.floor_num]
+    #     new_map = np.zeros_like(trav)
+    #
+    #     trav_space = np.where(trav == 255)
+    #     z_floor = self.scene.get_floor_height(self.floor_num)
+    #
+    #     height_map = self.get_height_map()
+    #
+    #     for idx in tqdm.tqdm(range(trav_space[0].shape[0])):
+    #         xy_map = np.array([trav_space[0][idx], trav_space[1][idx]])
+    #         x, y = self.scene.map_to_world(xy_map)  # np.array([xy_map[0], xy_map[1], z]))
+    #         # z = z_floor
+    #         z = height_map[x, y]
+    #
+    #         if self.test_valid_position('robot', self.robots[0], np.array([x, y, z])):
+    #             new_map[xy_map[0], xy_map[1]] = 255
+    #
+    #     img = Image.fromarray(new_map)
+    #     img.save(filename)
+    #
+    #     combined_map = np.stack([trav, new_map, np.zeros_like(new_map)], axis=-1)
+    #     img = Image.fromarray(combined_map)
+    #     img.save(filename[:-4]+"_comb.png")
+    #
+    #     free_space_accuracy = np.count_nonzero(new_map) / np.count_nonzero(trav)
+    #     print ("Free space accuracy: %f"%free_space_accuracy)
+    #     if free_space_accuracy < 0.2:
+    #         import ipdb; ipdb.set_trace()
+    #
+    #     # plt.figure()
+    #     # plt.imshow(combined_map)
+    #     # plt.show()
+    #     # import ipdb; ipdb.set_trace()
+    #
+    #     return new_map
+
+    @staticmethod
+    def is_straight_line_traversable(trav_map, pos1, pos2):
+        # assume continuous coordinates, where 0.5, 0.5 is the center of cell 0, 0
+
+        step_size = 0.05
+        pos1 =  np.array(pos1)
+        pos2 = np.array(pos2)
+        v = pos2 - pos1
+        v_norm = np.linalg.norm(v)
+        delta = v / v_norm * step_size
+
+        count = v_norm // step_size
+        points = pos1[None] + delta[None] * np.arange(count + 1)[:, None]
+        points = np.concatenate((points, pos2[None]), axis=0)
+
+        points_map = (points).astype(np.int32)
+        is_traversable = np.all(trav_map[points_map[:, 0], points_map[:, 1]] == 255)
+        return is_traversable
+
+    #
+    # @staticmethod
+    # def is_p2p_traversable(trav_map, pos1, pos2):
+    #     """Brensenham line algorithm
+    #     Ref: https://mail.scipy.org/pipermail/scipy-user/2009-September/022601.html"""
+    #
+    #     MAP_OBSTACLE = 0
+    #     x, y = np.array(pos1).astype(np.int32)
+    #     pos2 = np.array(pos2).astype(np.int32)
+    #     x0 = x
+    #     y0 = y
+    #     # Short-circuit if inside wall, or out of range
+    #     try:
+    #         if trav_map[x, y] == MAP_OBSTACLE:
+    #             return False
+    #     except IndexError:  # Out of range
+    #         return False
+    #
+    #     v = pos2 - pos1
+    #     theta = np.arctan2(v[1], v[0])
+    #
+    #     max_size = max(trav_map.shape[0], trav_map.shape[1])
+    #     x2 = x + int(max_size * np.cos(theta))
+    #     y2 = y + int(max_size * np.sin(theta))
+    #     # TODO this is a BUG here. map shape should not matter. biases non-cardinal values
+    #     is_steep = False
+    #
+    #     dx = abs(x2 - x)
+    #     if (x2 - x) > 0:
+    #         sx = 1
+    #     else:
+    #         sx = -1
+    #     dy = abs(y2 - y)
+    #     if (y2 - y) > 0:
+    #         sy = 1
+    #     else:
+    #         sy = -1
+    #
+    #     if dy > dx:  # Angle is steep - swap X and Y
+    #         is_steep = True
+    #         x, y = y, x
+    #         dx, dy = dy, dx
+    #         sx, sy = sy, sx
+    #     d = (2 * dy) - dx
+    #
+    #     import ipdb; ipdb.set_trace()
+    #     try:
+    #         for i in range(0, dx):
+    #             if is_steep:  # X and Y have been swapped  #coords.append((y,x))
+    #                 print (y, x)
+    #                 if trav_map[y, x] == MAP_OBSTACLE:
+    #                     return False
+    #             else:
+    #                 print (x, y)
+    #                 if trav_map[x, y] == MAP_OBSTACLE:
+    #                     return False
+    #             if x == pos2[0] and y == pos2[1]:
+    #                 # Reached pos2 without collision
+    #                 return True
+    #             while d >= 0:
+    #                 y = y + sy
+    #                 d = d - (2 * dx)
+    #             x = x + sx
+    #             d = d + (2 * dy)
+    #         raise ValueError("Never reached pos2")
+    #         # if is_steep:
+    #         #     dist = np.sqrt((y - x0) ** 2 + (x - y0) ** 2)
+    #         #     return y, x, min(dist, max_dist)
+    #         # else:
+    #         #     dist = np.sqrt((x - x0) ** 2 + (y - y0) ** 2)
+    #         #     return x, y, min(dist, max_dist)
+    #     except IndexError:  # Out of range
+    #         raise ValueError("Never reached pos2")
+    #
+    #         # if is_steep:
+    #         #     dist = np.sqrt((y - x0) ** 2 + (x - y0) ** 2)
+    #         #     return y, x, min(dist, max_dist)
+    #         # else:
+    #         #     dist = np.sqrt((x - x0) ** 2 + (y - y0) ** 2)
+    #         #     return x, y, min(dist, max_dist)
+
+    def get_better_trav_map(self, check_land_collision=False, base_on_original_travmap=True):
+        from gibson2.data.datasets import get_model_path
+        from PIL import Image
+        filename = os.path.join(get_model_path(self.scene.model_id), 'floor_scan_v3_{}.png'.format(self.floor_num))
+
+        # if os.path.exists(filename):
+        #     print("Load %s" % filename)
+        #     new_map = np.array(Image.open(filename))
+        #     return new_map
+
+        print("Generating %s" % filename)
+        if base_on_original_travmap:
+            base_map = self.scene.original_travmap_resized[self.floor_num]
+        elif check_land_collision:
+            base_map = self.scene.floor_scan2[self.floor_num]
+        else:
+            base_map = self.scene.floor_map[self.floor_num]
+
+        if check_land_collision:
+            max_z_difference = 0.08
+            z_extra = 0.03  # test_valid_position and land already adds initial_pos_z_offset=0.1 by default
+        else:
+            max_z_difference = 0.8
+            z_extra = 0.  # test_valid_position and land already adds initial_pos_z_offset=0.1 by default
+
+
+        new_map = np.zeros_like(base_map)
+        height_map = np.ones(self.scene.floor_map[self.floor_num].shape, np.float32) * (-1000.)
+
+        g = self.scene.floor_graph[self.floor_num]
+
+        initial_pos = self.robots[0].get_position()
+        source_node = tuple(self.scene.world_to_map(initial_pos[:2]))
+        z = initial_pos[2]
+
+        height_map[source_node[0], source_node[1]] = z
+        if not g.has_node(source_node):
+            nodes = np.array(g.nodes)
+            closest_node = tuple(nodes[np.argmin(np.linalg.norm(nodes - source_node, axis=1))])
+            g.add_edge(closest_node, source_node, weight=l2_distance(closest_node, source_node))
+
+        collision_nodes = []
+
+        for edge in tqdm.tqdm(list(nx.bfs_edges(g, source_node))):
+            node_from, node_to = edge
+            z_from = height_map[node_from[0], node_from[1]]
+            assert z_from > -999
+
+            x, y = self.scene.map_to_world(np.array(node_to))
+            pos_world = np.array([x, y, z_from + z_extra])  # self.scene.floors[self.floor_num]])  #
+            # pos_world = np.array([x, y, self.initial_pos[-1]])
+
+            if self.test_valid_position('robot', self.robots[0], pos_world):
+                land_success = self.land('robot', self.robots[0], pos_world, self.initial_orn)
+                # land_success = self.land('robot', self.robots[0], self.initial_pos, self.initial_orn)
+                # TODO construct scan map here. Make too large jumps invalid (e.g. stairs)
+                z_to = self.robots[0].get_position()[-1]
+                if np.abs(z_from - z_to) < max_z_difference:
+                    if check_land_collision:
+                        self.simulator.sync()
+                        is_collision_free = []
+                        for _ in range(1):
+                            self.robots[0].robot_specific_reset()
+                            self.robots[0].keep_still()
+
+                            # cache = self.before_simulation()
+                            collision_links = self.run_simulation()
+                            # self.after_simulation(cache, collision_links)
+                            collision_links_flatten = [item for sublist in collision_links for item in sublist]
+                            is_collision_free.append(len(collision_links_flatten) == 0)
+                        #     # state, reward, done, info = self.step(np.array([0., 0.]))
+                        #     # is_collision_free.append(not self.is_colliding)
+
+                        # update height
+                        z_to = self.robots[0].get_position()[-1]
+
+                        # # directly check
+                        # collision_links = self.filter_collision_links([list(
+                        #     p.getContactPoints(bodyA=self.robots[0].robot_ids[0]))])
+                        # is_collision_free = [len(collision_links[0]) == 0]
+
+                        # if (not is_collision_free[0]) and is_collision_free[-1]:
+                        #     print (is_collision_free)
+                        #     import ipdb; ipdb.set_trace()
+                        if is_collision_free[-1]:
+                            assert land_success
+                            new_map[node_to[0], node_to[1]] = 255
+                        else:
+                            collision_nodes.append(node_to)
+                            # print ("Collision at: ", node_to, " landed ", land_success)
+                    else:
+                        # Traversable
+                        new_map[node_to[0], node_to[1]] = 255
+                else:
+                    print ("Too large height difference: ", z_from, z_to, node_from, node_to)
+            else:
+                z_to = z_from
+            height_map[node_to[0], node_to[1]] = z_to
+
+        print ("Collisions: ")
+        print (collision_nodes)
+        img = Image.fromarray(new_map)
+        img.save(filename)
+
+        combined_map = np.stack([base_map, new_map, np.zeros_like(new_map)], axis=-1)
+        img = Image.fromarray(combined_map)
+        img.save(filename[:-4] + "_comb.png")
+
+        np.save(filename[:-4] + "_height.npy", height_map)
+
+        free_space_accuracy = np.count_nonzero(new_map) / np.count_nonzero(base_map)
+        print("Free space accuracy: %f" % free_space_accuracy)
+
+        # Move the robot back
+        self.land('robot', self.robots[0], self.initial_pos, self.initial_orn)
+
+        # m = height_map
+        # min_z = m[m > -500].min()
+        # m[m <= -500] = min_z - 0.2
+        # print (min_z, m.max(), m.max() - min_z)
+        # plt.imshow(m)
+        # plt.figure()
+        # plt.imshow(combined_map)
+        # plt.show()
+        # import ipdb; ipdb.set_trace()
+
+        if free_space_accuracy < 0.2:
+            import ipdb; ipdb.set_trace()
+
+        return new_map
+
+    # def get_height_map_simple(self):
+    #     z_extra = 0.0  # test_valid_position and land already adds initial_pos_z_offset=0.1 by default
+    #
+    #     g = self.scene.floor_graph[self.floor_num]
+    #     height_map = np.ones(self.scene.floor_map[self.floor_num].shape, np.float32) * (-1000.)
+    #
+    #     pos = self.robots[0].get_position()
+    #     z = pos[2]
+    #     source_node = self.scene.world_to_map(pos[:2])
+    #     height_map[source_node[0], source_node[1]] = z
+    #
+    #     import networkx as nx
+    #     for edge in tqdm.tqdm(nx.bfs_edges(g, tuple(source_node))):
+    #         node_from, node_to = edge
+    #         z_from = height_map[node_from[0], node_from[1]]
+    #         assert z_from > -999
+    #
+    #         pos_world = self.scene.map_to_world(np.array(node_to))
+    #         pos_world = np.concatenate([pos_world, [z_from + z_extra]], axis=-1)
+    #
+    #         if self.test_valid_position('robot', self.robots[0], pos_world):
+    #             self.land('robot', self.robots[0], pos_world, self.initial_orn)
+    #             z_to = self.robots[0].get_position()[-1]
+    #             # TODO construct scan map here. Make too large jumps invalid (e.g. stairs)
+    #             if np.abs(z_from - z_to) > 0.15:
+    #                 print (z_from, z_to)
+    #                 print (np.count_nonzero(height_map > -999), node_from, node_to)
+    #                 import ipdb; ipdb.set_trace()
+    #         else:
+    #             z_to = z_from
+    #         height_map[node_to[0], node_to[1]] = z_to
+    #
+    #     m = height_map
+    #     min_z = m[m > -500].min()
+    #     m[m <= -500] = min_z - 0.2
+    #     print (min_z, m.max(), m.max() - min_z)
+    #     plt.imshow(m)
+    #     plt.show()
+    #     import ipdb; ipdb.set_trace()
+    #
+    #     return height_map
+
+    def get_expert_action(self):
+        # max vel: 0.5m and max turn: 90deg pi/2
+        num_directions = 36
+        default_step = 0.3 # 0.2  # 1 * 0.1
+        default_turn = 2 * np.pi / num_directions  # 0.5 * np.pi/2
+        use_top_k_action = 4
+        method = 'head_to_subgoal'
+
+        scan_map = self.get_scan_map()
+        use_scan = 1
+        g = self.scene.floor_scan_graph[self.floor_num]
+        nodes = np.array(g.nodes)
+
+        pos = self.robots[0].get_position()
+        orn = self.robots[0].robot_body.get_orientation()
+        _, _, yaw = self.robots[0].get_rpy()
+        pos_map = self.scene.world_to_map(pos[:2])
+        pos_map_float = self.scene.world_to_map(pos[:2], keep_float=True)
+
+        # # test
+        # m = np.ones((2,3)) * 255
+        # m[0,0] = 0
+        # m[1, 2] = 0
+        # print (self.is_straight_line_traversable(m, np.array((1.5, 0.5)), np.array((0.5, 1.5))))
+        # print (self.is_straight_line_traversable(m, np.array((1.4, 0.5)), np.array((0.4, 1.5))))
+        # print (self.is_straight_line_traversable(m, np.array((1.5, 0.5)), np.array((0.5, 2.5))))
+        #
+        # import ipdb; ipdb.set_trace()
+        # try:
+        #     res = self.test_valid_area(pos)
+        #     import ipdb;
+        #     ipdb.set_trace()
+        # except AttributeError:
+        #     pass
+
+        path_map, current_path_len = self.scene.get_shortest_path(
+            self.floor_num, pos[:2], self.target_pos[:2], entire_path=True, use_scan_graph=use_scan,
+            return_path_in_graph=True)
+
+        is_free_on_scan_map2 = self.scene.floor_scan2[self.floor_num][pos_map[0], pos_map[1]] == 255
+        is_free_on_scan_map = scan_map[pos_map[0], pos_map[1]] == 255
+        is_near_obstacle1 = np.any(scan_map[max(pos_map[0]-1,0):pos_map[0]+2, max(pos_map[1]-1,0):pos_map[1]+2] == 0)
+        is_near_obstacle2 = np.any(scan_map[max(pos_map[0]-2,0):pos_map[0]+3, max(pos_map[1]-2,0):pos_map[1] + 3] == 0)
+        obstacle_distance = (0 if not is_free_on_scan_map2 else
+                             (1 if not is_free_on_scan_map else
+                              (2 if is_near_obstacle1 else
+                               (3 if is_near_obstacle2 else 100))))
+        # # iterative refinement
+        # if scan_map[pos_map[0], pos_map[1]] == 0 or not np.isfinite(current_path_len):
+        #     print("no path, trying unprocessed scan map")
+        #     use_scan = 2
+        #     scan_map = self.scene.floor_scan2[self.floor_num]
+        #     path_map, current_path_len = self.scene.get_shortest_path(
+        #         self.floor_num, pos[:2], self.target_pos[:2], entire_path=True, use_scan_graph=use_scan,
+        #         return_path_in_graph=True)
+        # if scan_map[pos_map[0], pos_map[1]] == 0 or not np.isfinite(current_path_len):
+        #     print("no path, trying original trav map")
+        #     use_scan = 0
+        #     scan_map = self.scene.floor_map[self.floor_num]
+        #     path_map, current_path_len = self.scene.get_shortest_path(
+        #         self.floor_num, pos[:2], self.target_pos[:2], entire_path=True, use_scan_graph=use_scan,
+        #         return_path_in_graph=True)
+
+        if not np.isfinite(current_path_len):
+            import ipdb; ipdb.set_trace()  # one strategy could be to back off, with a spin opposite of last rel turn
+
+        if method == 'hill_climb':
+            all_path_lens = self.get_path_lens_for_directions(scan_map, num_directions, default_step, default_turn)
+
+            # if not np.isfinite(all_path_lens.min()):
+            #     print ("no path, trying unprocessed scan map")
+            #     all_path_lens = self.get_path_lens_for_directions(scan_map, num_directions, default_step, default_turn, use_scan=use_scan)
+            #
+            # if not np.isfinite(all_path_lens.min()):
+            #     print ("no path, trying original trav map")
+            #     all_path_lens = self.get_path_lens_for_directions(
+            #         self.scene.floor_map[self.floor_num], num_directions, default_step, default_turn, use_scan=use_scan)
+
+            # Iterative refinement
+            if scan_map[pos_map[0], pos_map[1]] == 0:
+                # Robot is not in traversable area..
+                closest_node = nodes[np.argmin(np.linalg.norm(nodes - pos_map, axis=1))]
+                subgoal = self.scene.map_to_world(closest_node)
+                v = subgoal - pos[:2]
+                target_angle = np.arctan2(v[1], v[0])
+                angle_diff = target_angle - yaw
+                angle_diff = -angle_diff
+                angle_diff = angle_diff % (2*np.pi)  # 0..2pi
+                i = int(angle_diff // default_turn)
+                all_path_lens = [np.inf] * num_directions
+                all_path_lens[i] = 0
+                # angle_diff = (angle_diff + np.pi) % (2*np.pi) - np.pi
+
+
+                # use_top_k_action = 1
+                # if np.isfinite(all_path_lens.min()):
+                #     print ("Non-traversable pose. Go towards best direction")
+                # else:
+                #     scan_map = self.get_scan_map(kernel=1)
+                #     all_path_lens = self.get_path_lens_for_directions(scan_map, num_directions, default_step, default_turn)
+                #     while not np.isfinite(all_path_lens.min()) and default_step < 100:
+                #         default_step += 0.1
+                #         all_path_lens = self.get_path_lens_for_directions(scan_map, num_directions, default_step,
+                #                                                           default_turn)
+                #     print("Non-traversable pose. Removed erosion, go towards best direction (%f)"%default_step)
+
+            abs_best_1 = np.argmin(all_path_lens)
+            abs_best_k = np.argsort(all_path_lens)[:use_top_k_action]
+
+            best_i = (abs_best_1 + (num_directions // 2)) % num_directions - (num_directions // 2)
+
+            if all_path_lens[abs_best_1] > current_path_len:
+                import ipdb; ipdb.set_trace()
+
+        # elif method == 'head_to_subgoal_with_multiple_maps':
+        #     if scan_map[pos_map[0], pos_map[1]] == 0:
+        #         # Currently in non-traversable space. Head towards traversable direction
+        #         closest_node = nodes[np.argmin(np.linalg.norm(nodes - pos_map, axis=1))]
+        #         subgoal = self.scene.map_to_world(closest_node)
+        #     else:
+        #         for path_i, path_candidate_map in enumerate(path_map[1:10][::-1]):
+        #             if self.is_straight_line_traversable(scan_map, pos_map_float, path_candidate_map):
+        #                 subgoal = self.scene.map_to_world(path_candidate_map)
+        #                 print (path_i)
+        #                 break
+        #         else:
+        #             # Possible when trying to move diagonally near obstacles
+        #             v = path_map[1] - pos_map
+        #             if v[0] == 0 or v[1] == 0:
+        #                 raise ValueError("Nothing is reachable on the path, even though not a diagonal move.")
+        #             path_candidate_map = np.array(pos_map)
+        #             path_candidate_map[1] += v[1]
+        #             if self.is_straight_line_traversable(scan_map, pos_map, path_candidate_map):
+        #                 subgoal = path_candidate_map
+        #             else:
+        #                 path_candidate_map = np.array(pos_map)
+        #                 path_candidate_map[0] += v[0]
+        #                 if self.is_straight_line_traversable(scan_map, pos_map, path_candidate_map):
+        #                     subgoal = path_candidate_map
+        #                 else:
+        #                     print ("Forcing diagonal move")
+        #                     subgoal = path_map[1]
+
+        elif method == 'head_to_subgoal':  # with single cost map
+            lookahead = 1
+            if obstacle_distance <= 1:
+                # Currently in non-traversable space. Head towards traversable direction
+                # np.linalg.norm(pos_map)
+                subgoal_map = path_map[1]
+            else:
+                for path_i in range(min(8, len(path_map)-1), 0, -1):  # does not include 0
+                    lookahead = path_i
+                    subgoal_map = path_map[path_i]
+                    if self.is_straight_line_traversable(scan_map, pos_map_float, subgoal_map):
+                        break
+                else:
+                    subgoal_map = path_map[1]
+
+            subgoal = self.scene.map_to_world(subgoal_map)
+            v = subgoal - pos[:2]
+            target_angle = np.arctan2(v[1], v[0])
+            angle_diff = target_angle - yaw
+
+            angle_diff = angle_diff % (2 * np.pi)  # 0..2pi
+            i = int(angle_diff // default_turn)
+            all_path_lens = [np.inf] * num_directions
+            all_path_lens[i] = 0
+
+            # Todo could bias decision on heading error if near obstacle from one side
+
+            abs_best_1 = np.argmin(all_path_lens)
+            abs_best_k = np.argsort(all_path_lens)[:use_top_k_action]
+
+            best_i = (abs_best_1 + (num_directions // 2)) % num_directions - (num_directions // 2)
+
+            # angle_diff = (angle_diff + np.pi) % (2*np.pi) - np.pi  # -pi..pi
+            # best_i = int(angle_diff // default_turn)
+            #
+            # # dummy path lens
+            # all_path_lens = [np.inf] * num_directions
+            # all_path_lens[best_i] = 0
+            # abs_best_1 = np.argmin(all_path_lens)
+            # abs_best_k = np.argsort(all_path_lens)[:use_top_k_action]
+
+        else:
+            assert False
+
+        if obstacle_distance <= 1:  # in collision according to scan map (erode 5)
+            fwd_vel = 0.4
+            allow_fast_turn = False
+        elif obstacle_distance <= 2:  # next to obstacle according to scan map (erode 5)
+            fwd_vel = 0.5
+            allow_fast_turn = False
+        elif obstacle_distance <= 3:
+            fwd_vel = 0.8
+            allow_fast_turn = True
+        else:
+            fwd_vel = 1.0
+            allow_fast_turn = True
+        turn_vel = 0.6
+        if best_i == 0 or (0 in abs_best_k and all_path_lens[0] <= current_path_len):
+            action = np.array([fwd_vel, 0.], np.float32)
+            action_str = "F"
+        elif best_i <= -2 and allow_fast_turn:
+            action = np.array([0., -1.], np.float32)
+            action_str = "RR"
+        elif best_i < 0:
+            action = np.array([0., -turn_vel], np.float32)
+            action_str = "R"
+        elif best_i >= 2 and allow_fast_turn:
+            action = np.array([0., 1.], np.float32)
+            action_str = "LL"
+        else:
+            action = np.array([0., turn_vel], np.float32)
+            action_str = "L"
+
+        print("POS %d %d -- %d %d %s %.4f besti=%d v=%.4f %.4f %.4f look%d act=%s %s" % (
+            pos_map[0], pos_map[1], subgoal_map[0], subgoal_map[1], str(pos), np.rad2deg(yaw), best_i, current_path_len,
+            self.get_geodesic_potential(), all_path_lens[abs_best_1],
+            lookahead,
+            action_str, ("%d "%obstacle_distance if obstacle_distance <= 2 else "") + ("COL" if self.is_colliding else "")))
+
+        # pos = self.robots[0].get_position()[:2]
+        # source_map = self.scene.world_to_map(pos)
+        # trav_map[source_map[0]][source_map[1]] = 120
+
+        if self.is_colliding:
+            pos_map = self.scene.world_to_map(pos[:2])
+            pos_world = self.scene.map_to_world(pos_map)
+            pos_world = np.concatenate([pos_world, pos[-1:]], axis=-1)
+            # is_traversable1 = self.get_scan_map(kernel=1)[pos_map[0], pos_map[1]]
+            is_traversable1 = self.scene.floor_map[self.floor_num][pos_map[0], pos_map[1]]
+            is_traversable2 = scan_map[pos_map[0], pos_map[1]]
+            # valid1 = self.test_valid_position('robot', self.robots[0], pos)
+            # valid2 = self.test_valid_position('robot', self.robots[0], pos_world)
+
+            print (is_traversable1, is_traversable2)  #, valid1, valid2)
+
+            combined_map = np.stack([self.scene.floor_map[self.floor_num], scan_map, np.zeros_like(scan_map)], axis=-1)
+            combined_map[pos_map[0], pos_map[1], 2] = 255
+            plt.imshow(combined_map)
+            plt.show()
+
+            # example
+            # array([1.8       , 8.4       , 0.19183046])
+
+            if is_traversable2:
+                print ("Collision despite scan map shows traversable")
+                if obstacle_distance > 2:
+                    print ("Not even supposed to be near obstacle!")
+                    # res = self.test_valid_area(pos)
+                    # import ipdb; ipdb.set_trace()
+
+        return action
+
+    def get_path_lens_for_directions(self, trav_map, num_directions, default_step, default_turn, use_scan=1):
+        all_directions = []
+        all_path_lens = []
+        target = self.target_pos[:2]
+        for i in range(num_directions):
+            pos, orn = self.transition_turn_and_move(-i * default_turn, default_step)
+            source = pos[:2]
+            source_map = tuple(self.scene.world_to_map(source))
+            if trav_map[source_map[0]][source_map[1]] > 0:
+                _, path_len = self.scene.get_shortest_path(self.floor_num, source, target, entire_path=False,
+                                                           use_scan_graph=use_scan)
+            else:
+                path_len = np.inf
+            all_directions.append(pos)
+            all_path_lens.append(path_len)
+        return np.array(all_path_lens)
+
     def is_goal_reached(self):
         return l2_distance(self.get_position_of_interest(), self.target_pos) < self.dist_tol
 
@@ -488,7 +1137,8 @@ class NavigateEnv(BaseEnv):
         reward += potential_reward * self.potential_reward_weight  # |potential_reward| ~= 0.1 per step
         self.potential = new_potential
 
-        collision_reward = float(len(collision_links_flatten) > 0)
+        self.is_colliding = len(collision_links_flatten) > 0
+        collision_reward = float(self.is_colliding)
         self.collision_step += int(collision_reward)
         reward += collision_reward * self.collision_reward_weight  # |collision_reward| ~= 1.0 per step if collision
 
@@ -514,6 +1164,7 @@ class NavigateEnv(BaseEnv):
         if self.collision_step > self.max_collisions_allowed:
             done = True
             info['success'] = False
+            # import ipdb; ipdb.set_trace()
 
         # time out
         elif self.current_step >= self.max_step:
@@ -657,6 +1308,25 @@ class NavigateEnv(BaseEnv):
         body_id = obj.robot_ids[0] if obj_type == 'robot' else obj.body_id
         return self.check_collision(body_id)
 
+    def test_valid_area(self, pos, dist=0.1, resolution=0.01):
+        res = []
+        for i, x in enumerate(np.arange(-dist, dist, resolution)):
+            for j, y in enumerate(np.arange(-dist, dist, resolution)):
+                is_valid = self.test_valid_position('robot', self.robots[0], pos + np.array([x, y, 0]))
+                land_success = self.land('robot', self.robots[0], pos + np.array([x, y, 0]), self.initial_orn)
+
+                self.robots[0].apply_action((0, 0))
+                cache = self.before_simulation()
+                collision_links = self.run_simulation()
+                self.after_simulation(cache, collision_links)
+                collision_links_flatten = [item for sublist in collision_links for item in sublist]
+                is_collision_free = (len(collision_links_flatten) == 0)
+
+                res.append((x, y, is_valid, land_success, is_collision_free))
+                if not is_collision_free or not is_valid:
+                    print (res[-1])
+        return res
+
     def land(self, obj_type, obj, pos, orn):
         """
         Land the robot or the object onto the floor, given a valid position and orientation
@@ -690,6 +1360,8 @@ class NavigateEnv(BaseEnv):
         if obj_type == 'robot':
             obj.robot_specific_reset()
 
+        return land_success
+
     def reset_variables(self):
         """
         Reset bookkeeping variables for the next new episode
@@ -699,11 +1371,14 @@ class NavigateEnv(BaseEnv):
         self.collision_step = 0
         self.path_length = 0.0
         self.geodesic_dist = self.get_geodesic_potential()
+        self.shortest_paths = dict()
+        self.is_colliding = False
 
     def reset(self):
         """
         Reset episode
         """
+        self.is_colliding = False
         self.reset_agent()
         self.simulator.sync()
         state = self.get_state()
@@ -757,17 +1432,41 @@ class NavigateRandomEnv(NavigateEnv):
         check_collision_distance_time = np.sqrt(check_collision_distance / (0.5 * 9.8))
         self.check_collision_loop = int(check_collision_distance_time / self.physics_timestep)
 
+        self.fixed_floor = None
+        self.fixed_initial_pos = None
+        self.fixed_initial_orn = None
+        self.fixed_target_pos = None
+
     def reset_initial_and_target_pos(self):
         """
         Reset initial_pos, initial_orn and target_pos through randomization
         The geodesic distance (or L2 distance if traversable map graph is not built)
         between initial_pos and target_pos has to be between [self.target_dist_min, self.target_dist_max]
         """
-        _, self.initial_pos = self.scene.get_random_point_floor(self.floor_num, self.random_height)
+        # if self.scene.model_id == "Woonsocket":
+        #     self.initial_pos = np.array([-2.0, 8.0, 0.00642234832])
+        # # elif self.scene.model_id == "Anaheim":
+        # #     self.initial_pos = np.array([6.5,  2.15, -2.85896158])  # 6.5         2.15       -2.85896158
+        # else:
+        if self.fixed_initial_pos is None:
+            _, self.initial_pos = self.scene.get_random_point_floor(self.floor_num, self.random_height)
+        else:
+            self.initial_pos = self.fixed_initial_pos
+
         max_trials = 100
         dist = 0.0
         for _ in range(max_trials):  # if initial and target positions are < 1 meter away from each other, reinitialize
-            _, self.target_pos = self.scene.get_random_point_floor(self.floor_num, self.random_height)
+            if self.fixed_target_pos is None:
+                _, self.target_pos = self.scene.get_random_point_floor(self.floor_num, self.random_height)
+            else:
+                self.target_pos = self.fixed_target_pos
+            # if self.scene.model_id == "Albertville":
+            #     self.initial_pos = np.array([ -1.95, 2.  ,    -2.95269299])   # 200, 121
+            #     self.target_pos = np.array([-6.35,   2.9 ,    -2.95269299])     # 218, 33
+            # if self.scene.model_id == "Arkansaw":
+            #     self.initial_pos = np.array([-4.25,       3.75,       -2.28066945])   # 200, 121
+            #     self.target_pos = np.array([0.7       , -2.65      , -2.28066945])     # 218, 33
+
             if self.scene.build_graph:
                 _, dist = self.get_shortest_path(from_initial_pos=True)
             else:
@@ -776,7 +1475,11 @@ class NavigateRandomEnv(NavigateEnv):
                 break
         if not (self.target_dist_min < dist < self.target_dist_max):
             print("WARNING: Failed to sample initial and target positions")
-        self.initial_orn = np.array([0, 0, np.random.uniform(0, np.pi * 2)])
+        if self.fixed_initial_orn is None:
+            self.initial_orn = np.array([0, 0, np.random.uniform(0, np.pi * 2)])
+        else:
+            self.initial_orn = self.fixed_initial_orn
+        print (self.scene.model_id, self.floor_num, self.initial_pos, self.scene.world_to_map(self.initial_pos[:2]))
 
     def reset(self):
         """
@@ -786,7 +1489,9 @@ class NavigateRandomEnv(NavigateEnv):
         # reset "virtual floor" to the correct height
         self.scene.reset_floor(floor=self.floor_num, additional_elevation=0.02)
         state = super(NavigateRandomEnv, self).reset()
+
         return state
+
 
 
 class NavigateRandomEnvSim2Real(NavigateRandomEnv):
@@ -799,7 +1504,11 @@ class NavigateRandomEnvSim2Real(NavigateRandomEnv):
                  device_idx=0,
                  automatic_reset=False,
                  collision_reward_weight=0.0,
-                 track='static'
+                 track='static',
+                 floor=None,
+                 initial_pos=None,
+                 initial_orn=None,
+                 target_pos=None,
                  ):
         super(NavigateRandomEnvSim2Real, self).__init__(config_file,
                                                         model_id=model_id,
@@ -810,6 +1519,10 @@ class NavigateRandomEnvSim2Real(NavigateRandomEnv):
                                                         random_height=False,
                                                         device_idx=device_idx)
         self.collision_reward_weight = collision_reward_weight
+        self.fixed_floor = floor
+        self.fixed_initial_pos = initial_pos
+        self.fixed_initial_orn = initial_orn
+        self.fixed_target_pos = target_pos
 
         assert track in ['static', 'interactive', 'dynamic'], 'unknown track'
         self.track = track
@@ -943,7 +1656,11 @@ class NavigateRandomEnvSim2Real(NavigateRandomEnv):
         """
         Reset episode
         """
-        self.floor_num = self.scene.get_random_floor()
+        if self.fixed_floor is not None:
+            self.floor_num = self.fixed_floor
+        else:
+            self.floor_num = self.scene.get_random_floor()
+
         # reset "virtual floor" to the correct height
         self.scene.reset_floor(floor=self.floor_num, additional_elevation=0.02)
 
@@ -955,8 +1672,24 @@ class NavigateRandomEnvSim2Real(NavigateRandomEnv):
         if self.track == 'dynamic':
             self.reset_dynamic_objects()
             state = self.get_state()
-
         return state
+
+        #
+        # for floor in [0]: #range(len(self.scene.floors)):
+        #     self.floor_num = floor
+        #     # reset "virtual floor" to the correct height
+        #     self.scene.reset_floor(floor=self.floor_num, additional_elevation=0.02)
+        #
+        #     if self.track == 'interactive':
+        #         self.reset_interactive_objects()
+        #
+        #     state = NavigateEnv.reset(self)
+        #
+        #     if self.track == 'dynamic':
+        #         self.reset_dynamic_objects()
+        #         state = self.get_state()
+        #
+        # return state
 
     def crop_center_image(self, img):
         """
@@ -979,6 +1712,7 @@ class NavigateRandomEnvSim2Real(NavigateRandomEnv):
             if modality in state:
                 state[modality] = self.crop_center_image(state[modality])
         return state
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

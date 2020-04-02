@@ -1,2 +1,2 @@
-assets_path: assets #put either absolute path or relative to current directory
-dataset_path: dataset
+assets_path: /home/peacock/code/GibsonSim2RealChallenge/gibson-challenge-data/assets #put either absolute path or relative to current directory
+dataset_path: /home/peacock/code/GibsonSim2RealChallenge/gibson-challenge-data/dataset
