@@ -197,6 +197,8 @@ class BuildingScene(Scene):
                     scan_map = cv2.resize(scan_map, (scan_map_size, scan_map_size))
                     scan_map[scan_map < 255] = 0
 
+                # import ipdb; ipdb.set_trace()
+
                 # optimistic map. used as a basis for additional scan
                 original_travmap_resized = cv2.resize(trav_map, (self.trav_map_size, self.trav_map_size))
                 original_travmap_resized[original_travmap_resized > 0] = 255

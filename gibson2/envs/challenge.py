@@ -79,11 +79,12 @@ class Challenge:
         # use_scenarios = scenarios1
         # models = scenarios1['model_id']
 
-        # scenario_file = './results/scenarios_04-01-09-04-1585721347.pckl'
-        # use_scenarios = pickle.load(open(scenario_file, 'rb'))
-        # models = use_scenarios['model_id']
-        # models = list(enumerate(models))
-        # models = models[10:11]
+        scenario_file = './results/scenarios_04-01-09-04-1585721347.pckl'
+        # Convoy:  [ 0.35       1.05      -0.0185059] [121 107]   121 106
+        use_scenarios = pickle.load(open(scenario_file, 'rb'))
+        models = use_scenarios['model_id']
+        models = list(enumerate(models))
+        models = models[10:11]
 
         collected_scenarios = dict(model_id=[], floor=[], initial_pos=[], initial_orn=[], target_pos=[], outcome=[], seed=[])
         num_eval_episodes = 0

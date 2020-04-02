@@ -800,6 +800,23 @@ class NavigateEnv(BaseEnv):
         if free_space_accuracy < 0.2:
             import ipdb; ipdb.set_trace()
 
+
+        scan_filename = os.path.join(get_model_path(self.scene.model_id), 'floor_scan_{}.png'.format(self.floor_num))
+        scan_map = np.array(Image.open(scan_filename))
+        compare_map = cv2.resize(new_map, scan_map.shape)
+        compare_map[compare_map < 255] = 0
+
+        combined_map = np.stack([scan_map, compare_map, np.zeros_like(compare_map)], axis=-1)
+        img = Image.fromarray(combined_map)
+        img.save(filename[:-4] + "_comb_lowres.png")
+
+        scan_map = cv2.resize(scan_map, new_map.shape, interpolation=cv2.INTER_NEAREST)
+        compare_map = new_map
+
+        combined_map = np.stack([scan_map, compare_map, np.zeros_like(compare_map)], axis=-1)
+        img = Image.fromarray(combined_map)
+        img.save(filename[:-4] + "_comb_highres.png")
+
         return new_map
 
     # def get_height_map_simple(self):
@@ -1094,8 +1111,9 @@ class NavigateEnv(BaseEnv):
                 print ("Collision despite scan map shows traversable")
                 if obstacle_distance > 2:
                     print ("Not even supposed to be near obstacle!")
-                    # res = self.test_valid_area(pos)
-                    # import ipdb; ipdb.set_trace()
+                    res_here = self.test_valid_area(pos)
+                    res_target = self.test_valid_area(self.target_pos)
+                    import ipdb; ipdb.set_trace()
 
         return action
 
