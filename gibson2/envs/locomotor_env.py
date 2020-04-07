@@ -674,7 +674,7 @@ class NavigateEnv(BaseEnv):
     def get_better_trav_map(self, check_land_collision=False, base_on_original_travmap=True):
         from gibson2.data.datasets import get_model_path
         from PIL import Image
-        filename = os.path.join(get_model_path(self.scene.model_id), 'floor_scan_v3_{}.png'.format(self.floor_num))
+        filename = os.path.join(get_model_path(self.scene.model_id), 'floor_scan_v4_{}.png'.format(self.floor_num))
 
         # if os.path.exists(filename):
         #     print("Load %s" % filename)
@@ -693,8 +693,10 @@ class NavigateEnv(BaseEnv):
             max_z_difference = 0.08
             z_extra = 0.03  # test_valid_position and land already adds initial_pos_z_offset=0.1 by default
         else:
-            max_z_difference = 0.8
-            z_extra = 0.  # test_valid_position and land already adds initial_pos_z_offset=0.1 by default
+            # max_z_difference = 0.8
+            # z_extra = 0.  # test_valid_position and land already adds initial_pos_z_offset=0.1 by default
+            max_z_difference = 0.1
+            z_extra = 0.03  # test_valid_position and land already adds initial_pos_z_offset=0.1 by default
 
 
         new_map = np.zeros_like(base_map)
@@ -809,6 +811,9 @@ class NavigateEnv(BaseEnv):
         combined_map = np.stack([scan_map, compare_map, np.zeros_like(compare_map)], axis=-1)
         img = Image.fromarray(combined_map)
         img.save(filename[:-4] + "_comb_lowres.png")
+
+        img = Image.fromarray(compare_map)
+        img.save(filename[:-4] + "_res05.png")
 
         scan_map = cv2.resize(scan_map, new_map.shape, interpolation=cv2.INTER_NEAREST)
         compare_map = new_map
@@ -1111,9 +1116,9 @@ class NavigateEnv(BaseEnv):
                 print ("Collision despite scan map shows traversable")
                 if obstacle_distance > 2:
                     print ("Not even supposed to be near obstacle!")
-                    res_here = self.test_valid_area(pos)
-                    res_target = self.test_valid_area(self.target_pos)
-                    import ipdb; ipdb.set_trace()
+                    # res_here = self.test_valid_area(pos)
+                    # res_target = self.test_valid_area(self.target_pos)
+                    # import ipdb; ipdb.set_trace()
 
         return action
 

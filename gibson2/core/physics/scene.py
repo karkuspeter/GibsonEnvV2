@@ -78,7 +78,7 @@ class BuildingScene(Scene):
     """
     def __init__(self,
                  model_id,
-                 trav_map_resolution=0.01,
+                 trav_map_resolution=0.05,
                  trav_map_erosion=2,
                  build_graph=False,
                  should_load_replaced_objects=False,
@@ -99,7 +99,6 @@ class BuildingScene(Scene):
         print("building scene: %s" % model_id)
         self.model_id = model_id
         self.trav_map_default_resolution = 0.01  # each pixel represents 0.01m
-        self.scan_map_default_resolution = 0.05  # each pixel represents 0.05m
         self.trav_map_resolution = trav_map_resolution
         self.trav_map_original_size = None
         self.trav_map_size = None
@@ -110,6 +109,9 @@ class BuildingScene(Scene):
         self.num_waypoints = num_waypoints
         self.waypoint_interval = int(waypoint_resolution / trav_map_resolution)
         self.cache_shortest_paths = True
+        self.scan_filename = 'floor_scan_{}.png'
+        self.scan_map_default_resolution = 0.05  # each pixel represents 0.05m
+        self.allow_travmap_inleuof_scanmap = False
 
         # self.use_scan_map = use_scan_map
         # if self.use_scan_map:
@@ -187,11 +189,16 @@ class BuildingScene(Scene):
                                              self.trav_map_default_resolution /
                                              self.trav_map_resolution)
 
-                scan_filename = os.path.join(get_model_path(self.model_id), 'floor_scan_{}.png'.format(f))
+                scan_filename = os.path.join(get_model_path(self.model_id),
+                                             self.scan_filename.format(f))
+                                             # 'floor_scan_v3_res05_{}.png'.format(f))
+                                             #'floor_scan' + ('' if self.scan_map_default_resolution == 0.05 else '_v3')
+                                             # +  '_{}.png'.format(f))
                 if os.path.exists(scan_filename):
                     scan_map = np.array(Image.open(scan_filename))
                 else:
                     # scan_map = np.ones((5, 5)) * 255
+                    assert self.allow_travmap_inleuof_scanmap
                     scan_map = trav_map.copy()
                     scan_map_size = int(scan_map.shape[0] * self.trav_map_default_resolution / self.scan_map_default_resolution)
                     scan_map = cv2.resize(scan_map, (scan_map_size, scan_map_size))

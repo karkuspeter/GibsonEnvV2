@@ -1,4 +1,5 @@
 from gibson2.envs.locomotor_env import NavigateRandomEnvSim2Real
+import cv2
 import os, time
 import json
 import pickle
@@ -83,8 +84,11 @@ class Challenge:
         # Convoy:  [ 0.35       1.05      -0.0185059] [121 107]   121 106
         use_scenarios = pickle.load(open(scenario_file, 'rb'))
         models = use_scenarios['model_id']
-        models = list(enumerate(models))
-        models = models[10:11]
+        models = list(enumerate(models))  # [1:]
+        # models = [models[10], models[10], models[10]]
+
+        run_episode = True
+        generate_map = False
 
         collected_scenarios = dict(model_id=[], floor=[], initial_pos=[], initial_orn=[], target_pos=[], outcome=[], seed=[])
         num_eval_episodes = 0
@@ -129,37 +133,39 @@ class Challenge:
                 #     is_collision_free = (len(collision_links_flatten) == 0)
                 #     print (is_collision_free)
 
-                self.nav_env.get_better_trav_map(check_land_collision=False)
+                if generate_map:
+                    self.nav_env.get_better_trav_map(check_land_collision=False)
 
-                # # Set seed after reset so sampling initial and target states are not using this seed
-                # if not use_scenarios:
-                #     numpy_seed = np.random.randint(100000)
-                # else:
-                #     numpy_seed = use_scenarios['seed'][i]
-                # np.random.seed(numpy_seed)
-                #
-                # while True:
-                #     action = agent.act(state)
-                #     state, reward, done, info = self.nav_env.step(action)
-                #     total_reward += reward
-                #     if done:
-                #         break
-                #
-                # total_success += info['success']
-                # total_spl += info['spl']
-                # num_eval_episodes += 1
-                #
-                # if not info['success'] or info['collision_step'] > 0:
-                #     scenario = dict(
-                #         model_id=model_id,
-                #         floor=floor,
-                #         initial_pos=self.nav_env.initial_pos,
-                #         initial_orn=self.nav_env.initial_orn,
-                #         target_pos=self.nav_env.target_pos,
-                #         seed=numpy_seed,
-                #         outcome=info)
-                #     for key, val in scenario.items():
-                #         collected_scenarios[key].append(val)
+                if run_episode:
+                    # Set seed after reset so sampling initial and target states are not using this seed
+                    if not use_scenarios:
+                        numpy_seed = np.random.randint(100000)
+                    else:
+                        numpy_seed = use_scenarios['seed'][i]
+                    np.random.seed(numpy_seed)
+
+                    while True:
+                        action = agent.act(state)
+                        state, reward, done, info = self.nav_env.step(action)
+                        total_reward += reward
+                        if done:
+                            break
+
+                    total_success += info['success']
+                    total_spl += info['spl']
+                    num_eval_episodes += 1
+
+                    if not info['success'] or info['collision_step'] > 0:
+                        scenario = dict(
+                            model_id=model_id,
+                            floor=floor,
+                            initial_pos=self.nav_env.initial_pos,
+                            initial_orn=self.nav_env.initial_orn,
+                            target_pos=self.nav_env.target_pos,
+                            seed=numpy_seed,
+                            outcome=info)
+                        for key, val in scenario.items():
+                            collected_scenarios[key].append(val)
 
                 if use_scenarios:
                     break
@@ -182,7 +188,7 @@ class Challenge:
 
             with open('./results/eval_result_{}.json'.format(self.sim2real_track), 'w') as f:
                 json.dump(results, f)
-            with open('./results/scenarios_{}.pckl'.format(time.strftime('%m-%d-%M-%m-%s', time.localtime())), 'wb') as f:
+            with open('./results/scenarios_{}.pckl'.format(time.strftime('%m-%d-%H-%M-%S', time.localtime())), 'wb') as f:
                 pickle.dump(collected_scenarios, f)
                 print ("Saved to " + f.name)
 
@@ -208,6 +214,170 @@ class Challenge:
 
         #with open('eval_episodes.json', 'w') as f:
         #    json.dump(str(episodes), f)
+
+    @staticmethod
+    def image_to_string(image):
+        # convert float to uint
+        if image.dtype != np.uint8:
+            image = (image * 255).astype(np.uint8)
+        return cv2.imencode(".png", image)[1].tostring()
+
+    def save_episodes(self, agent, output_filename=None):
+
+        import tensorflow as tf
+        from tfrecordfeatures import tf_bytelist_feature, tf_bytes_feature, tf_int64_feature
+        import gibson2
+
+        total_reward = 0.0
+        total_success = 0.0
+        total_spl = 0.0
+
+        if output_filename is None:
+            output_filename = './data/scenarios_{}.tfrecords'.format(time.strftime('%m-%d-%H-%M-%S', time.localtime()))
+        tfwriter = tf.python_io.TFRecordWriter(output_filename)
+
+        models = sorted(os.listdir(gibson2.dataset_path))
+        models = models[:10]
+        use_scenarios = False
+
+        # scenario_file = './results/scenarios_04-01-09-04-1585721347.pckl'
+        # use_scenarios = pickle.load(open(scenario_file, 'rb'))
+        # models = use_scenarios['model_id']
+
+        print (models)
+        models = list(enumerate(models))  # [1:]
+        num_eval_models = len(models)
+
+        write_each_step_separately = True
+        num_episodes_per_floor = 10
+
+        collected_scenarios = dict(model_id=[], floor=[], initial_pos=[], initial_orn=[], target_pos=[], outcome=[], seed=[])
+        num_eval_episodes = 0
+
+        for i, model_id in models:
+            if use_scenarios:
+                floor = use_scenarios['floor'][i]
+                self.nav_env = NavigateRandomEnvSim2Real(config_file=self.config_file,
+                                                         model_id=model_id,
+                                                         mode='headless',
+                                                         action_timestep=1.0 / 10.0,
+                                                         physics_timestep=1.0 / 40.0,
+                                                         track=self.sim2real_track,
+                                                         floor=floor,
+                                                         initial_pos=use_scenarios['initial_pos'][i],
+                                                         initial_orn=use_scenarios['initial_orn'][i],
+                                                         target_pos=use_scenarios['target_pos'][i],)
+            else:
+                floor = 0
+                self.nav_env = NavigateRandomEnvSim2Real(config_file=self.config_file,
+                                                         model_id=model_id,
+                                                         mode='headless',
+                                                         action_timestep=1.0 / 10.0,
+                                                         physics_timestep=1.0 / 40.0,
+                                                         track=self.sim2real_track,
+                                                         floor=floor)
+
+            num_episodes_this_floor = 0
+
+            while True:
+                avg_success = total_success /  max(num_eval_episodes, 1)
+                avg_spl = total_spl /  max(num_eval_episodes, 1)
+                print('Episode: {}/{}/{} {}/{}. Success: {} SPL: {}'.format(
+                    i + 1, num_eval_models, floor, num_episodes_this_floor, num_episodes_per_floor, avg_success, avg_spl))
+                self.nav_env.fixed_floor = floor
+                state = self.nav_env.reset()
+
+                # Set seed after reset so sampling initial and target states are not using this seed
+                if not use_scenarios:
+                    numpy_seed = np.random.randint(100000)
+                else:
+                    numpy_seed = use_scenarios['seed'][i]
+                np.random.seed(numpy_seed)
+
+                actions = []
+                rgbs = []
+                depths = []
+                poses = []
+                quaternions = []
+                rpy = []
+
+                while True:
+                    action = agent.act(state)
+                    state, reward, done, info = self.nav_env.step(action)
+                    total_reward += reward
+
+                    actions.append(action)
+                    rgbs.append(state['rgb'])
+                    depths.append(state['depth'])
+                    poses.append(self.nav_env.robots[0].get_position())
+                    quaternions.append(self.nav_env.robots[0].get_orientation())
+                    rpy.append(self.nav_env.robots[0].get_rpy())
+
+                    if done:
+                        break
+
+                rpy1 = self.nav_env.robots[0].rpy_from_orn(self.nav_env.robots[0].get_orientation())
+                rpy2 = self.nav_env.robots[0].get_rpy()
+                assert rpy1 == rpy2
+
+                # store trajectory
+                features = {
+                    'model_id': tf_bytes_feature(str(model_id).encode()),
+                    'floor': tf_int64_feature(floor),
+                    'start_pos': tf_bytes_feature(self.nav_env.initial_pos.astype(np.float32).tostring()),
+                    'target_pos': tf_bytes_feature(self.nav_env.target_pos.astype(np.float32).tostring()),
+                    'start_rpy': tf_bytes_feature(self.nav_env.initial_orn.astype(np.float32).tostring()),
+                    'target_rpy': tf_bytes_feature(self.nav_env.target_orn.astype(np.float32).tostring()),
+                    # 'start_rpy': tf_bytes_feature(self.nav_env.robots[0].rpy_from_orn(self.nav_env.initial_orn).astype(np.float32).tostring()),
+                    # 'target_rpy': tf_bytes_feature(self.nav_env.robots[0].rpy_from_orn(self.nav_env.target_orn).astype(np.float32).tostring()),
+
+                    'seed': tf_int64_feature(numpy_seed),
+                    'info': tf_bytes_feature(pickle.dumps(info, 0)),
+
+                    'poses': tf_bytes_feature(np.array(poses, 'f').tostring()),
+                    'orientations': tf_bytes_feature(np.array(quaternions, 'f').tostring()),
+                    'rpy': tf_bytes_feature(np.array(rpy, 'f').tostring()),
+                    'actions': tf_bytes_feature(np.array(actions, 'f').tostring()),
+
+                    'depths': tf_bytelist_feature([self.image_to_string(x) for x in depths]),
+                    'rgbs': tf_bytelist_feature([self.image_to_string(x) for x in rgbs]),
+                }
+
+                example = tf.train.Example(features=tf.train.Features(feature=features))
+                tfwriter.write(example.SerializeToString())
+                tfwriter.flush()
+
+                num_eval_episodes += 1
+                num_episodes_this_floor += 1
+
+                if not info['success'] or info['collision_step'] > 0:
+                    scenario = dict(
+                        model_id=model_id,
+                        floor=floor,
+                        initial_pos=self.nav_env.initial_pos,
+                        initial_orn=self.nav_env.initial_orn,
+                        target_pos=self.nav_env.target_pos,
+                        seed=numpy_seed,
+                        outcome=info)
+                    for key, val in scenario.items():
+                        collected_scenarios[key].append(val)
+
+                if use_scenarios:
+                    break
+
+                if num_episodes_this_floor >= num_episodes_per_floor:
+                    floor += 1
+                    num_episodes_this_floor = 0
+                    if floor >= len(self.nav_env.scene.floors):
+                        break
+
+            # Clean up simulator before loading new model.
+            self.nav_env.simulator.disconnect()
+
+        avg_reward = total_reward / num_eval_episodes
+        avg_success = total_success /  num_eval_episodes
+        avg_spl = total_spl /  num_eval_episodes
+
 
 if __name__ == "__main__":
     challenge = Challenge()

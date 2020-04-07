@@ -128,6 +128,9 @@ class LocomotorRobot(BaseRobot):
     def get_rpy(self):
         return self.robot_body.get_rpy()
 
+    def rpy_from_orn(self, orn):
+        return p.getEulerFromQuaternion(orn)
+
     def apply_real_action(self, action):
         if self.control == 'torque':
             for n, j in enumerate(self.ordered_joints):
